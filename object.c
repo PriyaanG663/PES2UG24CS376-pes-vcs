@@ -16,6 +16,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <openssl/evp.h>
+#include <errno.h>
 
 // ─── PROVIDED ────────────────────────────────────────────────────────────────
 
@@ -36,13 +37,26 @@ int hex_to_hash(const char *hex, ObjectID *id_out) {
     return 0;
 }
 
-void compute_hash(const void *data, size_t len, ObjectID *id_out) {
+// Compute SHA-256 hash of data, store in id_out.
+// Returns 0 on success, -1 on error.
+int compute_hash(const void *data, size_t len, ObjectID *id_out) {
     unsigned int hash_len;
     EVP_MD_CTX *ctx = EVP_MD_CTX_new();
-    EVP_DigestInit_ex(ctx, EVP_sha256(), NULL);
-    EVP_DigestUpdate(ctx, data, len);
-    EVP_DigestFinal_ex(ctx, id_out->hash, &hash_len);
+    if (!ctx) return -1;
+    if (EVP_DigestInit_ex(ctx, EVP_sha256(), NULL) != 1) {
+        EVP_MD_CTX_free(ctx);
+        return -1;
+    }
+    if (EVP_DigestUpdate(ctx, data, len) != 1) {
+        EVP_MD_CTX_free(ctx);
+        return -1;
+    }
+    if (EVP_DigestFinal_ex(ctx, id_out->hash, &hash_len) != 1) {
+        EVP_MD_CTX_free(ctx);
+        return -1;
+    }
     EVP_MD_CTX_free(ctx);
+    return 0;
 }
 
 // Get the filesystem path where an object should be stored.
@@ -94,9 +108,90 @@ int object_exists(const ObjectID *id) {
 //
 // Returns 0 on success, -1 on error.
 int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out) {
-    // TODO: Implement
-    (void)type; (void)data; (void)len; (void)id_out;
-    return -1;
+    const char *type_strs[] = {"blob", "tree", "commit"};
+    const char *type_str = type_strs[type];
+
+    char header[256];
+    snprintf(header, sizeof(header), "%s %zu", type_str, len);
+    size_t header_len = strlen(header) + 1; // include \0
+
+    size_t full_len = header_len + len;
+    void *full_data = malloc(full_len);
+    if (!full_data) return -1;
+
+    memcpy(full_data, header, header_len);
+    memcpy((char *)full_data + header_len, data, len);
+
+    if (compute_hash(full_data, full_len, id_out) != 0) {
+        free(full_data);
+        return -1;
+    }
+    // If object already exists, no need to write (dedupe)
+    if (object_exists(id_out)) {
+        free(full_data);
+        return 0;
+    }
+
+    char path[512];
+    object_path(id_out, path, sizeof(path));
+
+    char shard_dir[512];
+    char hex[HASH_HEX_SIZE + 1];
+    hash_to_hex(id_out, hex);
+    // Ensure .pes/objects and shard directory exist
+    if (mkdir(OBJECTS_DIR, 0755) != 0 && errno != EEXIST) {
+        free(full_data);
+        return -1;
+    }
+    snprintf(shard_dir, sizeof(shard_dir), "%s/%.2s", OBJECTS_DIR, hex);
+    if (mkdir(shard_dir, 0755) != 0 && errno != EEXIST) {
+        free(full_data);
+        return -1;
+    }
+
+    char temp_path[1024];
+    snprintf(temp_path, sizeof(temp_path), "%s.tmp", path);
+
+    int fd = open(temp_path, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+    if (fd == -1) {
+        free(full_data);
+        return -1;
+    }
+
+    ssize_t wrote = write(fd, full_data, full_len);
+    if (wrote != (ssize_t)full_len) {
+        close(fd);
+        unlink(temp_path);
+        free(full_data);
+        return -1;
+    }
+
+    // Ensure data is flushed to disk
+    if (fsync(fd) != 0) {
+        close(fd);
+        unlink(temp_path);
+        free(full_data);
+        return -1;
+    }
+
+    close(fd);
+
+    // Atomically move into place
+    if (rename(temp_path, path) == -1) {
+        unlink(temp_path);
+        free(full_data);
+        return -1;
+    }
+
+    // fsync the shard directory to persist the rename
+    int dfd = open(shard_dir, O_DIRECTORY | O_RDONLY);
+    if (dfd != -1) {
+        fsync(dfd);
+        close(dfd);
+    }
+
+    free(full_data);
+    return 0;
 }
 
 // Read an object from the store.
@@ -122,7 +217,86 @@ int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out
 // The caller is responsible for calling free(*data_out).
 // Returns 0 on success, -1 on error (file not found, corrupt, etc.).
 int object_read(const ObjectID *id, ObjectType *type_out, void **data_out, size_t *len_out) {
-    // TODO: Implement
-    (void)id; (void)type_out; (void)data_out; (void)len_out;
-    return -1;
+    char path[512];
+    object_path(id, path, sizeof(path));
+
+    FILE *f = fopen(path, "rb");
+    if (!f) return -1;
+
+    fseek(f, 0, SEEK_END);
+    size_t file_len = ftell(f);
+    fseek(f, 0, SEEK_SET);
+
+    void *file_data = malloc(file_len);
+    if (!file_data) {
+        fclose(f);
+        return -1;
+    }
+
+    if (fread(file_data, 1, file_len, f) != file_len) {
+        free(file_data);
+        fclose(f);
+        return -1;
+    }
+    fclose(f);
+
+    char *null_pos = memchr(file_data, '\0', file_len);
+    if (!null_pos) {
+        free(file_data);
+        return -1;
+    }
+
+    size_t header_len = null_pos - (char *)file_data;
+    char header[256];
+    memcpy(header, file_data, header_len);
+    header[header_len] = '\0';
+
+    char type_str[10];
+    size_t size_val;
+    if (sscanf(header, "%s %zu", type_str, &size_val) != 2) {
+        free(file_data);
+        return -1;
+    }
+
+    ObjectType type;
+    if (strcmp(type_str, "blob") == 0) type = OBJ_BLOB;
+    else if (strcmp(type_str, "tree") == 0) type = OBJ_TREE;
+    else if (strcmp(type_str, "commit") == 0) type = OBJ_COMMIT;
+    else {
+        free(file_data);
+        return -1;
+    }
+
+    size_t data_start = header_len + 1;
+    if (data_start + size_val != file_len) {
+        free(file_data);
+        return -1;
+    }
+
+    void *data = malloc(size_val);
+    if (!data) {
+        free(file_data);
+        return -1;
+    }
+    memcpy(data, (char *)file_data + data_start, size_val);
+
+    // Verify hash
+    ObjectID computed;
+    if (compute_hash(file_data, file_len, &computed) != 0) {
+        free(data);
+        free(file_data);
+        return -1;
+    }
+    // Ensure the computed hash matches the requested id
+    if (memcmp(computed.hash, id->hash, HASH_SIZE) != 0) {
+        free(data);
+        free(file_data);
+        return -1;
+    }
+
+    free(file_data);
+    *type_out = type;
+    *data_out = data;
+    *len_out = size_val;
+    return 0;
 }

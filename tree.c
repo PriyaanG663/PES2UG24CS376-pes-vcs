@@ -10,6 +10,7 @@
 //   "100644 hello.txt\0" followed by 32 raw bytes of SHA-256
 
 #include "tree.h"
+#include "index.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -129,9 +130,82 @@ int tree_serialize(const Tree *tree, void **data_out, size_t *len_out) {
 //   - object_write    : save that binary buffer to the store as OBJ_TREE
 //
 // Returns 0 on success, -1 on error.
+static int build_tree(const IndexEntry *entries, int count, const char *prefix, ObjectID *id_out) {
+    Tree tree;
+    tree.count = 0;
+
+    typedef struct {
+        char name[256];
+        int is_dir;
+        ObjectID hash;
+        uint32_t mode;
+    } PendingEntry;
+
+    PendingEntry pending[MAX_TREE_ENTRIES];
+    int pending_count = 0;
+
+    for (int i = 0; i < count; i++) {
+        const char *path = entries[i].path;
+        size_t prefix_len = strlen(prefix);
+        if (strncmp(path, prefix, prefix_len) != 0) continue;
+        const char *remaining = path + prefix_len;
+        if (*remaining == '\0') continue;
+        const char *slash = strchr(remaining, '/');
+        if (slash) {
+            size_t name_len = slash - remaining;
+            char name[256];
+            memcpy(name, remaining, name_len);
+            name[name_len] = '\0';
+            int found = 0;
+            for (int j = 0; j < pending_count; j++) {
+                if (strcmp(pending[j].name, name) == 0 && pending[j].is_dir) {
+                    found = 1;
+                    break;
+                }
+            }
+            if (!found && pending_count < MAX_TREE_ENTRIES) {
+                strcpy(pending[pending_count].name, name);
+                pending[pending_count].is_dir = 1;
+                pending[pending_count].mode = MODE_DIR;
+                pending_count++;
+            }
+        } else {
+            char name[256];
+            strcpy(name, remaining);
+            if (pending_count < MAX_TREE_ENTRIES) {
+                strcpy(pending[pending_count].name, name);
+                pending[pending_count].is_dir = 0;
+                pending[pending_count].hash = entries[i].hash;
+                pending[pending_count].mode = entries[i].mode;
+                pending_count++;
+            }
+        }
+    }
+
+    for (int i = 0; i < pending_count; i++) {
+        if (pending[i].is_dir) {
+            char sub_prefix[512];
+            snprintf(sub_prefix, sizeof(sub_prefix), "%s%s/", prefix, pending[i].name);
+            if (build_tree(entries, count, sub_prefix, &pending[i].hash) != 0) return -1;
+        }
+        if (tree.count < MAX_TREE_ENTRIES) {
+            strcpy(tree.entries[tree.count].name, pending[i].name);
+            tree.entries[tree.count].hash = pending[i].hash;
+            tree.entries[tree.count].mode = pending[i].mode;
+            tree.count++;
+        }
+    }
+
+    void *data;
+    size_t len;
+    if (tree_serialize(&tree, &data, &len) != 0) return -1;
+    int ret = object_write(OBJ_TREE, data, len, id_out);
+    free(data);
+    return ret;
+}
+
 int tree_from_index(ObjectID *id_out) {
-    // TODO: Implement recursive tree building
-    // (See Lab Appendix for logical steps)
-    (void)id_out;
-    return -1;
+    Index index;
+    if (index_load(&index) != 0) return -1;
+    return build_tree(index.entries, index.count, "", id_out);
 }
